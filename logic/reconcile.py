@@ -91,4 +91,7 @@ def reconcile_orders(shopify_df: pd.DataFrame, stripe_df: pd.DataFrame) -> tuple
 
 
 def summary_to_csv(summary: pd.DataFrame, sep: str = ",") -> str:
-    return summary.to_csv(index=False, sep=sep)
+    export = summary.copy()
+    for col in ("Gross Sales ($)", "Processing Fee ($)", "Net Payout ($)"):
+        export[col] = export[col].map(lambda x: f"{float(x):.2f}")
+    return export.to_csv(index=False, sep=sep)
