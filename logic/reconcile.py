@@ -1,5 +1,7 @@
 """Reconcile Shopify orders against Stripe payout rows."""
 
+from io import BytesIO
+
 import pandas as pd
 
 STRIPE_RATE = 0.029
@@ -90,8 +92,11 @@ def reconcile_orders(shopify_df: pd.DataFrame, stripe_df: pd.DataFrame) -> tuple
     return summary, metrics
 
 
-def summary_to_csv(summary: pd.DataFrame, sep: str = ",") -> str:
+def summary_to_csv(summary: pd.DataFrame, sep: str = ",") -> bytes:
     export = summary.copy()
-    for col in ("Gross Sales ($)", "Processing Fee ($)", "Net Payout ($)"):
-        export[col] = export[col].map(lambda x: f"${float(x):.2f}")
-    return export.to_csv(index=False, sep=sep)
+    money_cols = ("Gross Sales ($)", "Processing Fee ($)", "Net Payout ($)")
+    for col in money_cols:
+        export[col] = export[col].map(lambda x: f"{float(str(x).replace('$', '')):.2f}")
+    buf = BytesIO()
+    export.to_csv(buf, index=False, sep=sep, encoding="utf-8-sig")
+    return buf.getvalue()
