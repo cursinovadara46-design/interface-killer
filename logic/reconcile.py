@@ -1,7 +1,4 @@
-"""Reconcile Shopify orders against Stripe payout rows."""
-
-from io import BytesIO
-
+﻿from io import BytesIO
 import pandas as pd
 
 STRIPE_RATE = 0.029
@@ -15,85 +12,106 @@ SUMMARY_COLUMNS = [
 ]
 
 
-def _estimate_fee(gross: float) -> float:
-    return round(gross * STRIPE_RATE + STRIPE_FIXED_FEE, 2)
+def reconcile_orders(shopify_df: pd.DataFrame, stripe_df: pd.DataFrame):
+    shopify = shopify_df.copy()
+    stripe = stripe_df.copy()
 
+    shopify["order_id_clean"] = shopify["Name"].astype(str).str.strip()
+    stripe["description_clean"] = stripe["Description"].astype(str).str.strip()
 
-def _status(
-    shopify_gross: float | None,
-    stripe_gross: float | None,
-    has_shopify: bool,
-    has_stripe: bool,
-) -> str:
-    if has_shopify and not has_stripe:
-        return "Shopify Only — no Stripe match"
-    if has_stripe and not has_shopify:
-        return "Stripe Only — no Shopify match"
-    if stripe_gross is None or pd.isna(stripe_gross):
-        return "Matched — Stripe fee estimated"
-    if shopify_gross is not None and abs(shopify_gross - stripe_gross) <= 0.05:
-        return "Matched"
-    return "Amount Mismatch — review manually"
-
-
-def reconcile_orders(shopify_df: pd.DataFrame, stripe_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    shopify = shopify_df.groupby("order_id", as_index=False)["gross_sales"].sum()
-    stripe = stripe_df.groupby("order_id", as_index=False).agg(
-        gross_sales=("gross_sales", "sum"),
-        processing_fee=("processing_fee", "sum"),
-        net_payout=("net_payout", "sum"),
+    merged = pd.merge(
+        shopify,
+        stripe,
+        left_on="order_id_clean",
+        right_on="description_clean",
+        how="outer",
+        suffixes=("_shopify", "_stripe"),
     )
-    merged = shopify.merge(stripe, on="order_id", how="outer", suffixes=("_shopify", "_stripe"))
 
-    rows = []
-    for _, row in merged.iterrows():
-        order_id = row["order_id"]
-        gross = float(row["gross_sales_shopify"]) if pd.notna(row["gross_sales_shopify"]) else float(
-            row["gross_sales_stripe"] or 0
+    reconciled_rows = []
+    matched_count = 0
+    mismatch_count = 0
+    missing_stripe_count = 0
+    missing_shopify_count = 0
+
+    for idx, row in merged.iterrows():
+        order_id = (
+            row["order_id_clean"]
+            if pd.notna(row["order_id_clean"])
+            else row["description_clean"]
         )
-        has_shopify = pd.notna(row["gross_sales_shopify"])
-        has_stripe = pd.notna(row["gross_sales_stripe"]) or pd.notna(row["processing_fee"]) or pd.notna(
-            row["net_payout"]
-        )
-        stripe_gross = row["gross_sales_stripe"] if pd.notna(row["gross_sales_stripe"]) else None
-        shopify_gross = float(row["gross_sales_shopify"]) if has_shopify else None
+        has_shopify = pd.notna(row.get("Total_shopify")) or pd.notna(row.get("Name"))
+        has_stripe = pd.notna(row.get("Amount")) or pd.notna(row.get("Description"))
 
-        if pd.notna(row["processing_fee"]) and row["processing_fee"] > 0:
-            fee = float(row["processing_fee"])
-        else:
-            fee = _estimate_fee(gross)
+        if has_shopify and has_stripe:
+            gross = float(row.get("Total_shopify", 0.0) or 0.0)
+            expected_fee = round((gross * STRIPE_RATE) + STRIPE_FIXED_FEE, 2)
+            expected_net = round(gross - expected_fee, 2)
 
-        if pd.notna(row["net_payout"]) and row["net_payout"] > 0:
-            net = float(row["net_payout"])
-        else:
-            net = round(gross - fee, 2)
+            actual_fee = abs(float(row.get("Fee", 0.0) or 0.0))
+            actual_net = float(row.get("Net", 0.0) or 0.0)
 
-        rows.append(
-            {
-                "Shopify Order ID": f"#{order_id}",
-                "Gross Sales ($)": round(gross, 2),
-                "Processing Fee ($)": round(fee, 2),
-                "Net Payout ($)": round(net, 2),
-                "Reconciliation Status": _status(
-                    shopify_gross,
-                    stripe_gross,
-                    has_shopify,
-                    has_stripe,
-                ),
-            }
-        )
+            fee_diff = abs(expected_fee - actual_fee)
+            net_diff = abs(expected_net - actual_net)
 
-    summary = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
+            if fee_diff <= 0.05 and net_diff <= 0.05:
+                status = "Matched"
+                matched_count += 1
+            else:
+                status = "Fee Mismatch"
+                mismatch_count += 1
+
+            reconciled_rows.append(
+                {
+                    "Shopify Order ID": order_id,
+                    "Gross Sales ($)": gross,
+                    "Processing Fee ($)": actual_fee,
+                    "Net Payout ($)": actual_net,
+                    "Reconciliation Status": status,
+                }
+            )
+        elif has_shopify and not has_stripe:
+            gross = float(row.get("Total_shopify", 0.0) or 0.0)
+            missing_stripe_count += 1
+            reconciled_rows.append(
+                {
+                    "Shopify Order ID": order_id,
+                    "Gross Sales ($)": gross,
+                    "Processing Fee ($)": 0.0,
+                    "Net Payout ($)": 0.0,
+                    "Reconciliation Status": "Missing in Stripe",
+                }
+            )
+        elif has_stripe and not has_shopify:
+            missing_shopify_count += 1
+            reconciled_rows.append(
+                {
+                    "Shopify Order ID": order_id,
+                    "Gross Sales ($)": 0.0,
+                    "Processing Fee ($)": abs(float(row.get("Fee", 0.0) or 0.0)),
+                    "Net Payout ($)": float(row.get("Net", 0.0) or 0.0),
+                    "Reconciliation Status": "Missing in Shopify",
+                }
+            )
+
+    summary = pd.DataFrame(reconciled_rows)
+
     metrics = {
-        "total_gross": round(summary["Gross Sales ($)"].sum(), 2),
-        "total_fees": round(summary["Processing Fee ($)"].sum(), 2),
-        "net_deposit": round(summary["Net Payout ($)"].sum(), 2),
+        "total_orders": len(summary),
+        "matched": matched_count,
+        "mismatched": mismatch_count,
+        "missing_stripe": missing_stripe_count,
+        "missing_shopify": missing_shopify_count,
     }
+
     return summary, metrics
 
 
 def _format_csv_amount(value) -> str:
-    return f"{float(value):.2f}".replace(".", ",")
+    try:
+        return f"{float(value):.2f}".replace(".", ",")
+    except (ValueError, TypeError):
+        return str(value)
 
 
 def summary_to_csv(summary: pd.DataFrame) -> bytes:
@@ -108,7 +126,7 @@ def summary_to_csv(summary: pd.DataFrame) -> bytes:
     )
     for col in money_cols:
         if col in export.columns:
-            export[col] = export[col].map(_format_csv_amount)
+            export[col] = export[col].apply(_format_csv_amount)
 
     buf = BytesIO()
     export.to_csv(buf, index=False, sep=";", encoding="utf-8-sig")
