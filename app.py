@@ -62,7 +62,7 @@ if shopify_bytes and stripe_bytes:
 
         st.download_button(
             label="Download clean CSV for QuickBooks (.csv)",
-            data=summary_to_csv(summary, sep=";"),
+            data=summary_to_csv(summary),
             file_name="shopify_stripe_reconciliation.csv",
             mime="text/csv",
             type="primary",
